@@ -1,4 +1,5 @@
 import psycopg2
+import json
 import configparser
 from pathlib import Path
 from cjio import cityjson
@@ -12,6 +13,7 @@ schema = config['DEFAULT']['schema']
 table = config['DEFAULT']['table']
 dbname = config['DEFAULT']['dbname']
 user = config['DEFAULT']['user']
+bbox = [111664.8,559448.0, 113415.9,560217.5]
 
 cm = cityjson.CityJSON()
 
@@ -24,7 +26,8 @@ def simpletocjio(geom):
         s.append(tuple(c))
     return s
 
-def runquery(query, type):
+def runquery(query):
+    
     global cm
     conn = psycopg2.connect(
         host=host,
@@ -32,6 +35,7 @@ def runquery(query, type):
         user=user
     )
     cur = conn.cursor()
+    cur.execute("CREATE SEQUENCE IF NOT EXISTS counter;")
     cur.execute(query)
     rows = cur.fetchall()
     conn.commit()
@@ -75,8 +79,23 @@ def runquery(query, type):
         geom.surfaces = srf
         
         #-------------------------
-        
-        co.type = type
+        mat = {
+            "irradiation": { 
+                "values": [[]] 
+            }
+        }
+        for i,color in enumerate(row[3]):
+            if color == '#F8F8f8':
+                mat['irradiation']['values'][0].append(1)
+            elif color == '#FF9823':
+                mat['irradiation']['values'][0].append(0)
+            else:
+                mat['irradiation']['values'][0].append(0)
+        geom.material = mat
+
+
+        #-------------------------
+        co.type = row[5]
         cm.cityobjects[co.id] = co
 
     cityobjects, vertex_lookup = cm.reference_geometry()
@@ -86,96 +105,106 @@ def runquery(query, type):
 
 
 
-query = """
+buildingquery = """
 WITH sub AS (
     SELECT gridid,
         blockid,
         id,
         colors,
         (ST_Dump(geom)).*
-    FROM {}.{} 
-    WHERE ST_Intersects(geom_2d,ST_MakeEnvelope(117366.5,560858.7, 119841.7,562233.9,28992))
+    FROM results.extruded 
+    WHERE ST_Intersects(geom_2d,ST_MakeEnvelope({},{},{},{},28992))
     --LIMIT 100 --safety
 )
 SELECT 
     gridid,
     blockid,
-    id,
+    nextval('counter') as id,
     colors,
-    array_agg(ST_AsText(ST_ExteriorRing(geom))) geom
+    array_agg(ST_AsText(ST_ExteriorRing(geom))) geom,
+    'Building' AS type
     FROM sub
     GROUP BY gridid,
     blockid,
     id,
     colors   
 ;
-""".format(schema,table)
+""".format(bbox[0],bbox[1],bbox[2],bbox[3])
+runquery(buildingquery)
 
-runquery(query, 'Building')
+landquery = """
+    WITH sub AS (
+        SELECT gridid,
+            id as blockid,
+            id,
+            ARRAY['#000000'] as colors,
+            type,
+            geom
+        FROM results.bgtvlakkenz 
+        WHERE ST_Intersects(geom,ST_MakeEnvelope({},{},{},{},28992))
+        --LIMIT 100 --safety
+    )
+    SELECT 
+        gridid,
+        blockid,
+        nextval('counter') as id,
+        colors,
+        array_agg(ST_AsText(ST_Reverse(ST_ExteriorRing(geom)))) geom,
+        CASE 
+            WHEN type IN ('onbegroeidterreindeel') THEN 'LandUse'
+            WHEN type IN ('begroeidterreindeel') THEN 'PlantCover'
+            WHEN type IN ('wegdeel','ondersteunendwegdeel') THEN 'Road'
+            WHEN type IN ('waterdeel','ondersteunendwaterdeel') THEN 'WaterBody'
+        END as type    
+        FROM sub
+        GROUP BY gridid,
+        blockid,
+        id,
+        type,
+        colors   
+    ;
+    """.format(bbox[0],bbox[1],bbox[2],bbox[3])
+runquery(landquery)
 
-#--- end of buildings
+#ADd materials to cm.j.cityObjects.materials
+arr = cm.j['CityObjects']
+matarray = []
+for o in arr:
+    
+    #cm.j['CityObjects'][o]['geometry'][0]["material"] = 
+    matarray.append({
+        "roof": {
+            "values": cm.j['CityObjects'][o]['geometry'][0]['semantics']['values']
+        }
+    })
+    #print(cm.j['CityObjects'][o])
 
-query = """
-SELECT gridid, 
-    id as blockid, 
-    id, 
-    ARRAY['#F8F8f8'] as colors,
-    array_agg(ST_AsText(ST_ExteriorRing(ST_Reverse(geom)))) geom
-FROM results.bgtvlakkenz
-WHERE ST_Intersects(geom,ST_MakeEnvelope(117366.5,560858.7, 119841.7,562233.9,28992))
-AND landuse != 'groenvoorziening'
-GROUP BY gridid, blockid, id, colors;
-"""
-runquery(query,'LandUse')
-
-#--- Plantcover
-query = """
-SELECT gridid, 
-    id as blockid, 
-    id, 
-    ARRAY['#F8F8f8'] as colors,
-    array_agg(ST_AsText(ST_ExteriorRing(ST_Reverse(geom)))) geom
-FROM results.bgtvlakkenz
-WHERE ST_Intersects(geom,ST_MakeEnvelope(117366.5,560858.7, 119841.7,562233.9,28992))
-AND landuse = 'groenvoorziening'
-GROUP BY gridid, blockid, id, colors;
-"""
-runquery(query,'PlantCover')
-
-
-
-def addmaterial():
-    #ADd materials to cm.j.cityObjects.materials
-    arr = cm.j['CityObjects']
-    for o in arr:
-        #print(cm.j['CityObjects'][o])
-        pass
-        #cm.j['CityObjects'][o]["material"] = {
-        #    "roof": { 
-        #        "values": [[0, 0, 1, null]] 
-                #"""
-                #TODO cm.j['CityObjects'][o]['semantics']['surfaces'] -> find values from:
-                #'semantics': {
-                #    'surfaces': [
-                #        {'type': 'WallSurface'}, 
-                #        {'type': 'GroundSurface'}, 
-                #        {'type': 'RoofSurface'}
-                #    ], 
-                #    'values': [
-                #        [2, 2, 2, 2, 2, 2, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
-                #    ]
-                #}
-                #"""
-        #    },
-        #    "wall": { 
-        #        "values": [[2, 2, 1, null]] 
-        #    }
-        #}
+    #cm.j['CityObjects'][o]["material"] = {
+    #    "roof": { 
+    #        "values": [[0, 0, 1, null]] 
+            #"""
+            #TODO cm.j['CityObjects'][o]['semantics']['surfaces'] -> find values from:
+            #'semantics': {
+            #    'surfaces': [
+            #        {'type': 'WallSurface'}, 
+            #        {'type': 'GroundSurface'}, 
+            #        {'type': 'RoofSurface'}
+            #    ], 
+            #    'values': [
+            #        [2, 2, 2, 2, 2, 2, 2, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]
+            #    ]
+            #}
+            #"""
+    #    },
+    #    "wall": { 
+    #        "values": [[2, 2, 1, null]] 
+    #    }
+    #}
 
 
 cm.j["materials"] = [
   {
-    "name": "roof",
+    "name": "blue",
     "ambientIntensity":  0.2000,
     "diffuseColor":  [0.9000, 0.1000, 0.7500],
     "emissiveColor": [0.9000, 0.1000, 0.7500],
@@ -185,7 +214,7 @@ cm.j["materials"] = [
     "isSmooth": False
   },
   {
-    "name": "wall",
+    "name": "red",
     "ambientIntensity":  0.4000,
     "diffuseColor":  [0.1000, 0.1000, 0.9000],
     "emissiveColor": [0.1000, 0.1000, 0.9000],
@@ -193,11 +222,38 @@ cm.j["materials"] = [
     "shininess": 0.0,
     "transparency": 0.5,
     "isSmooth": True
-  }            
+  },
+  {
+    "name": "green",
+    "ambientIntensity":  0.2000,
+    "diffuseColor":  [0.9000, 0.1000, 0.7500],
+    "emissiveColor": [0.9000, 0.1000, 0.7500],
+    "specularColor": [0.9000, 0.1000, 0.7500],
+    "shininess": 0.2,
+    "transparency": 0.5,
+    "isSmooth": False
+  }
 ]
-
+print('Update bbox')
 cm.update_bbox()
-cm.validate()
+print('Validating')
 
 outfile = 'mycitymodel.json'
-cityjson.save(cm, outfile)
+#cityjson.save(cm, outfile)
+
+cityobjects, vertex_lookup = cm.reference_geometry()
+cm.add_to_j(cityobjects, vertex_lookup)
+#Add materials
+for mat in matarray:
+    cm.j['CityObjects'][o]['geometry'][0]["material"] = mat
+
+cm.remove_duplicate_vertices()
+cm.remove_orphan_vertices()
+#cm.validate()
+
+try:
+    with open(outfile, 'w') as fout:
+        json_str = json.dumps(cm.j, indent=2)
+        fout.write(json_str)
+except IOError as e:
+    raise IOError('Invalid output file: %s \n%s' % (path, e))
